@@ -298,7 +298,7 @@ def ensure_login():
     print("登录完成后，请关闭Chrome窗口，系统将自动保存登录态。")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=False)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
         try:
@@ -372,7 +372,7 @@ def is_logged_in() -> bool:
 def _open_authenticated_page(url: str, cookie_path: str, label: str):
     """使用Playwright打开已认证页面，不自动关闭，供用户自行查看。"""
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=False)
+        browser = p.chromium.launch(headless=False)
         context = _create_context_with_cookies(browser, cookie_path)
         page = context.new_page()
         try:
@@ -516,35 +516,46 @@ def get_items_on_date(target_date, target_count: int = 200,
     """获取目标日期的饰品列表。
 
     categories: 品类 value 列表，如 ["hands", "type_customplayer"]。
-                None 或包含空字符串表示"全部"（不加品类筛选）。
-    多品类时各品类独立抓取，数量均分。
+                None / [] / 含空字符串表示"全部"（不加品类筛选）。
+    1 个品类（含"全部"）：按原有逻辑依次翻页提取。
+    2+ 个品类：多品类并行，各品类独立抓取且数量均分。
     """
     if not categories or any(c in ("", "全部/不限") for c in categories):
         categories = [""]
 
+    multi = len(categories) >= 2
     per_category = max(1, target_count // len(categories))
 
     all_items = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = p.chromium.launch(headless=True)
         context = _create_context_with_cookies(browser, config.COOKIE_PATH)
         page = context.new_page()
 
         for i, cat in enumerate(categories):
-            cat_label = cat or "全部"
             cat_items = _fetch_category_items(page, cat, per_category, min_price, min_volume)
             all_items.extend(cat_items)
 
-            remain = target_count - len(all_items)
-            # 如果某个品类抓不够，把差额匀给后续品类
-            if i < len(categories) - 1 and len(cat_items) < per_category:
-                shortfall = per_category - len(cat_items)
-                remaining_cats = len(categories) - i - 1
-                per_category = max(1, per_category + shortfall // remaining_cats)
+            if multi:
+                remain = target_count - len(all_items)
+                if i < len(categories) - 1 and len(cat_items) < per_category:
+                    shortfall = per_category - len(cat_items)
+                    remaining_cats = len(categories) - i - 1
+                    per_category = max(1, per_category + shortfall // remaining_cats)
 
         browser.close()
 
-    return all_items
+    # 多品类去重：同一 item_id 可能出现在多个品类搜索结果中
+    seen = set()
+    unique_items = []
+    for item in all_items:
+        if item.item_id not in seen:
+            seen.add(item.item_id)
+            unique_items.append(item)
+    if len(unique_items) < len(all_items):
+        print(f"[BUFF] 多品类抓取发现 {len(all_items) - len(unique_items)} 个重复饰品，已去重")
+
+    return unique_items
 
 
 def _choose_time_range(days_needed: int, start_date: date = None) -> str:
@@ -838,7 +849,7 @@ def get_full_price_history(item_id: str, time_label: str = "最近3个月") -> d
     result = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = p.chromium.launch(headless=True)
         context = _create_context_with_cookies(browser, config.COOKIE_PATH)
         page = context.new_page()
 
@@ -1041,7 +1052,7 @@ def diagnose_price_extraction(item_id: str, start_date: date, end_date: date) ->
                       "detail": f"直接 API 调用失败: {api_error}\n降级到 Playwright 浏览器提取"})
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = p.chromium.launch(headless=True)
         context = _create_context_with_cookies(browser, config.COOKIE_PATH)
         page = context.new_page()
         _inject_network_hooks(page)       # 注入 JS 层 XHR/fetch/jQuery 拦截

@@ -4,6 +4,7 @@
 提取 SSR 数据中的 buckets，匹配变体后调用 pricehistory API 获取历史价格。
 """
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -16,10 +17,16 @@ try:
 except Exception:
     pass
 
+# 设置代理环境变量（确保 Playwright 内置 Chromium 能通过代理访问 Steam）
+os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7890")
+os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7890")
+os.environ.setdefault("NO_PROXY", "buff.163.com,.163.com,.qq.com,.aliyuncs.com,.cn")
+
 from playwright.sync_api import sync_playwright
 
 # 最后一次错误的详情，供 app.py 错误日志使用
 _last_error: str = ""
+_last_error_context: dict = {}  # 结构化错误现场信息（URL、标题、截图路径等）
 
 import config
 from core.buff_scraper import (
@@ -59,7 +66,7 @@ def ensure_steam_login():
     print("登录完成后，关闭浏览器窗口即可，系统将自动保存登录态。")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=False)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
         login_url = (
@@ -215,12 +222,63 @@ def _click_wear_button(page, wear: str | None):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 按基础皮肤名分组（Step 3 批处理优化）
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_base_skin_name(name: str) -> str:
+    """从完整饰品名中提取基础皮肤名（去磨损后缀和 StatTrak 前缀）。"""
+    base = re.sub(r'^StatTrak™\s*', '', name).strip()
+    wear_keywords = '|'.join([
+        '崭新出厂', '略有磨损', '久经沙场', '破损不堪', '战痕累累',
+        'Factory New', 'Minimal Wear', 'Field-Tested', 'Well-Worn',
+        'Battle-Scarred',
+    ])
+    base = re.sub(rf'\s*\((?:{wear_keywords})\)\s*$', '', base).strip()
+    return base
+
+
+def group_by_skin_name(items: list) -> dict:
+    """将饰品列表按基础皮肤名分组，同组饰品共用一个 Steam listing 页面。
+
+    返回: {base_skin_name: [item1, item2, ...]}
+    """
+    groups = {}
+    for item in items:
+        base = _get_base_skin_name(item.name)
+        groups.setdefault(base, []).append(item)
+    return groups
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Step 3 核心
 # ═══════════════════════════════════════════════════════════════════
 
 def get_last_steam_error() -> str:
     """返回最后一次 Steam 数据获取的失败原因，供调用方记录错误日志。"""
     return _last_error
+
+
+def get_last_steam_error_context() -> dict:
+    """返回最后一次 Steam 数据获取的结构化错误现场信息。"""
+    return _last_error_context
+
+
+def _try_add_cookies(context, cookies: list, label: str):
+    """安全地添加 cookies 到浏览器上下文，记录被拒绝的 cookie 而不是静默忽略。"""
+    if not cookies:
+        print(f"[Steam] {label}: 无 cookies")
+        return
+    rejected = 0
+    for c in cookies:
+        # 修复 sameSite 兼容性：Playwright 要求 exact 字符串
+        if "sameSite" in c and c["sameSite"] not in ("Strict", "Lax", "None"):
+            c["sameSite"] = "Lax"
+        try:
+            context.add_cookies([c])
+        except Exception as ex:
+            rejected += 1
+    if rejected:
+        print(f"[Steam] {label}: {len(cookies)} cookies 中 {rejected} 个被拒绝")
 
 
 def get_steam_market_data(item_id: str, target_dates: List[date],
@@ -231,28 +289,47 @@ def get_steam_market_data(item_id: str, target_dates: List[date],
     """
     global _last_error
     goods_url = f"https://buff.163.com/goods/{item_id}"
-    result = None
     target_set = set(target_dates)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
-        context = browser.new_context()
+    for attempt in range(2):
+        result = _try_get_steam_data(item_id, goods_url, target_set,
+                                     buff_item_name, attempt)
+        if result is not None:
+            return result
+        if attempt == 0:
+            print(f"[Steam] 第1次失败，等待后重试...（错误: {_last_error}）")
+            import time
+            time.sleep(5)
 
-        # 加载 Steam cookies 优先（决定货币为 USD），与诊断脚本保持一致
-        steam_cookies = _load_cookies_from(config.STEAM_COOKIE_PATH)
-        if steam_cookies:
-            for c in steam_cookies:
-                try:
-                    context.add_cookies([c])
-                except Exception:
-                    pass
-        buff_cookies = _load_cookies_from(config.COOKIE_PATH)
-        if buff_cookies:
-            for c in buff_cookies:
-                try:
-                    context.add_cookies([c])
-                except Exception:
-                    pass
+    return None
+
+
+def _try_get_steam_data(item_id: str, goods_url: str,
+                         target_set: set, buff_item_name: str,
+                         attempt: int) -> Optional[dict]:
+    """单次尝试获取 Steam 数据，支持尝试次数追踪。"""
+    global _last_error, _last_error_context
+    result = None
+    # 重置上下文
+    _last_error_context = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, proxy=config.PROXY_CONFIG)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="zh-CN",
+        )
+
+        # 加载 cookies（Steam 优先，决定货币为 USD）
+        _try_add_cookies(context,
+                         _load_cookies_from(config.STEAM_COOKIE_PATH), "Steam")
+        _try_add_cookies(context,
+                         _load_cookies_from(config.COOKIE_PATH), "BUFF")
 
         page = context.new_page()
 
@@ -261,25 +338,95 @@ def get_steam_market_data(item_id: str, target_dates: List[date],
             page.wait_for_load_state("networkidle", timeout=60000)
             sleep_random(1.0, 2.0)
 
+            # ── 检查 BUFF 页面是否正常（防止已下架/404） ──
+            buff_title = page.title()
+            buff_url_current = page.url
+            if any(kw in buff_title.lower()
+                   for kw in ["页面不存在", "出错", "404", "not found", "error"]):
+                _last_error = "BUFF 详情页异常（页面不存在或已下架）"
+                _last_error_context = {
+                    "type": "buff_page_error",
+                    "buff_url": goods_url,
+                    "current_url": buff_url_current,
+                    "page_title": buff_title,
+                    "detail": "该饰品在 BUFF 上可能已下架或链接失效",
+                }
+                print(f"[Steam] {_last_error} | title={buff_title}")
+                return None
+
             btn = _find_steam_market_button(page)
             if not btn:
                 _last_error = "未找到 '查看Steam市场' 按钮"
+                _last_error_context = {
+                    "type": "button_not_found",
+                    "buff_url": goods_url,
+                    "current_url": buff_url_current,
+                    "page_title": buff_title,
+                    "detail": "BUFF页面未加载完整或该饰品没有关联的Steam市场页面",
+                }
                 print(f"[Steam] {_last_error}")
                 return None
 
-            with context.expect_page(timeout=15000) as new_page_event:
-                btn.click()
+            # ── 点击 Steam 按钮，处理新标签页 / 当前标签页两种情形 ──
+            steam_page = _click_and_get_steam_page(page, context, btn)
+            if steam_page is None:
+                current_url = page.url[:100]
+                _last_error = f"无法打开 Steam 页面（当前 URL: {current_url}）"
+                _last_error_context = {
+                    "type": "steam_page_not_opened",
+                    "buff_url": goods_url,
+                    "current_url": current_url,
+                    "page_title": buff_title,
+                    "detail": "href导航/dispatchEvent/当前标签页降级 三种方式均失败",
+                }
+                print(f"[Steam] {_last_error}")
+                return None
 
-            steam_page = new_page_event.value
             steam_url = steam_page.url
             market_hash_name = _extract_market_hash_name(steam_url) or ""
 
-            steam_page.wait_for_load_state("networkidle", timeout=60000)
+            # 等待 Steam 页面加载，检测是否显示错误或登录页
+            try:
+                steam_page.wait_for_load_state("networkidle", timeout=90000)
+            except Exception as e:
+                print(f"[Steam] 等待页面加载超时: {e}")
+
+            # 检查 Steam 页面是否正常（不是错误页）
+            steam_title = steam_page.title()
+            if any(word in steam_title.lower()
+                   for word in ["sorry", "error", "not found"]):
+                _last_error = f"Steam 返回了错误页面（title: {steam_title}）"
+                _last_error_context = {
+                    "type": "steam_error_page",
+                    "buff_url": goods_url,
+                    "steam_url": steam_url[:100],
+                    "page_title": steam_title,
+                    "detail": "Steam 返回了 'Sorry' / 'Error' 类错误页",
+                }
+                print(f"[Steam] {_last_error}")
+                return None
+
+            # 检查是否被重定向到 Steam 登录页
+            if "login" in steam_page.url.lower() and "market" not in steam_page.url.lower():
+                _last_error = f"Steam 重定向到登录页: {steam_page.url[:100]}"
+                _last_error_context = {
+                    "type": "steam_login_redirect",
+                    "buff_url": goods_url,
+                    "redirect_url": steam_page.url[:100],
+                    "page_title": steam_title,
+                    "detail": "Steam cookie 可能已过期，需重新登录",
+                }
+                print(f"[Steam] {_last_error}")
+                return None
+
             # 强制美元：重新导航到同 URL 追加 ?cc=us 参数
             if "?cc=us" not in steam_page.url:
                 usd_url = steam_url.split("?")[0] + "?cc=us"
-                steam_page.goto(usd_url, timeout=30000)
-                steam_page.wait_for_load_state("networkidle", timeout=30000)
+                try:
+                    steam_page.goto(usd_url, timeout=45000)
+                    steam_page.wait_for_load_state("networkidle", timeout=45000)
+                except Exception as e:
+                    print(f"[Steam] ?cc=us 导航超时: {e}")
                 if "?cc=us" not in steam_page.url:
                     print(f"[Steam] 警告: ?cc=us 重定向后 URL 不包含参数: {steam_page.url[:100]}")
             steam_url = steam_page.url
@@ -301,6 +448,12 @@ def get_steam_market_data(item_id: str, target_dates: List[date],
             ssr_data = _extract_ssr_buckets(steam_page)
             if not ssr_data:
                 _last_error = "无法提取 Steam SSR buckets 数据"
+                _last_error_context = {
+                    "type": "ssr_extraction_failed",
+                    "steam_url": steam_url[:100],
+                    "page_title": steam_title,
+                    "detail": "window.SSR.loaderData 不存在或格式不符",
+                }
                 print(f"[Steam] {_last_error}")
                 return None
 
@@ -321,7 +474,20 @@ def get_steam_market_data(item_id: str, target_dates: List[date],
                         break
 
             if not matched:
-                _last_error = f"未找到匹配的 Steam bucket（BUFF属性: wear={props.get('wear')}, StatTrak={props.get('stattrak')}）"
+                _last_error = (
+                    f"未找到匹配的 Steam bucket"
+                    f"（BUFF属性: wear={props.get('wear')}, "
+                    f"StatTrak={props.get('stattrak')}）"
+                )
+                _last_error_context = {
+                    "type": "bucket_match_failed",
+                    "steam_url": steam_url[:100],
+                    "buff_props": props,
+                    "available_buckets": [
+                        b.get("localized_name") for b in buckets[:20]
+                    ],
+                    "detail": "Steam listing 页中没有与 BUFF 变体属性匹配的 bucket",
+                }
                 print(f"[Steam] {_last_error}")
                 return None
 
@@ -361,14 +527,280 @@ def get_steam_market_data(item_id: str, target_dates: List[date],
                 ],
             }
         except Exception as e:
-            _last_error = f"Steam 浏览器异常: {e}"
-            print(f"[Steam] {_last_error}")
             import traceback
+            _last_error = f"Steam 浏览器异常: {e}"
+            _last_error_context = {
+                "type": "exception",
+                "buff_url": goods_url,
+                "exception": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+            }
+            print(f"[Steam] {_last_error}")
             traceback.print_exc()
         finally:
             browser.close()
 
         return result
+
+
+def get_steam_market_data_batch(
+    representative_item_id: str,
+    group_members: List[dict],
+) -> dict:
+    """批量获取同一基础名下多个变体的 Steam 数据，只打开一次 Steam 页面。
+
+    Args:
+        representative_item_id: 组内任意一个 item_id，用于导航到 Steam listing。
+        group_members: [{"item_id": str, "buff_item_name": str,
+                         "target_dates": List[date]}, ...]
+
+    Returns:
+        {item_id: {steam_url, market_hash_name, steam_price,
+                   steam_sold_count, steam_price_history, date_records},
+         ...}
+    """
+    global _last_error, _last_error_context
+    _last_error_context = {}
+    goods_url = f"https://buff.163.com/goods/{representative_item_id}"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, proxy=config.PROXY_CONFIG)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="zh-CN",
+        )
+        _try_add_cookies(context,
+                         _load_cookies_from(config.STEAM_COOKIE_PATH), "Steam")
+        _try_add_cookies(context,
+                         _load_cookies_from(config.COOKIE_PATH), "BUFF")
+        page = context.new_page()
+
+        results = {}
+        steam_page = None
+
+        try:
+            # ── ① 打开 BUFF 详情页 ──
+            buff_title = ""
+            page.goto(goods_url, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=60000)
+            sleep_random(1.0, 2.0)
+            buff_title = page.title()
+
+            # ── ② 检查 BUFF 页面是否正常 ──
+            if any(kw in buff_title.lower()
+                   for kw in ["页面不存在", "出错", "404", "not found", "error"]):
+                _last_error = "BUFF 详情页异常（页面不存在或已下架）"
+                _last_error_context = {
+                    "type": "buff_page_error",
+                    "group_items": len(group_members),
+                    "buff_url": goods_url,
+                    "page_title": buff_title,
+                    "detail": "代表饰品在 BUFF 上可能已下架，整组跳过",
+                }
+                print(f"[Steam][批] {_last_error} | title={buff_title}")
+                return results
+
+            # ── ③ 查找 Steam 按钮 ──
+            btn = _find_steam_market_button(page)
+            if not btn:
+                _last_error = "未找到 '查看Steam市场' 按钮"
+                _last_error_context = {
+                    "type": "button_not_found",
+                    "group_items": len(group_members),
+                    "buff_url": goods_url,
+                    "page_title": buff_title,
+                    "detail": "BUFF页面未加载完整或该组饰品均无Steam市场链接",
+                }
+                print(f"[Steam][批] {_last_error}")
+                return results
+
+            # ── ④ 跳转 Steam ──
+            steam_page = _click_and_get_steam_page(page, context, btn)
+            if steam_page is None:
+                _last_error = "无法打开 Steam 页面"
+                _last_error_context = {
+                    "type": "steam_page_not_opened",
+                    "group_items": len(group_members),
+                    "buff_url": goods_url,
+                    "page_title": buff_title,
+                    "detail": "href/dispatchEvent/当前标签页降级 三种方式均失败",
+                }
+                print(f"[Steam][批] {_last_error}")
+                return results
+
+            steam_url = steam_page.url
+            try:
+                steam_page.wait_for_load_state("networkidle", timeout=90000)
+            except Exception:
+                pass
+            if "?cc=us" not in steam_page.url:
+                usd_url = steam_url.split("?")[0] + "?cc=us"
+                try:
+                    steam_page.goto(usd_url, timeout=45000)
+                    steam_page.wait_for_load_state("networkidle", timeout=45000)
+                except Exception:
+                    pass
+            steam_url = steam_page.url
+            sleep_random(1.5, 2.5)
+
+            # ── ⑤ 提取 SSR buckets（一次提取，多次匹配） ──
+            ssr_data = _extract_ssr_buckets(steam_page)
+            if not ssr_data:
+                _last_error = "无法提取 Steam SSR buckets 数据"
+                _last_error_context = {
+                    "type": "ssr_extraction_failed",
+                    "group_items": len(group_members),
+                    "steam_url": steam_url[:100],
+                    "detail": "window.SSR.loaderData 不存在或格式不符",
+                }
+                print(f"[Steam][批] {_last_error}")
+                return results
+
+            buckets = ssr_data.get("buckets", [])
+            initial_fallback_id = ssr_data.get("initialFallbackBucketID")
+            print(f"[Steam][批] 获取到 {len(buckets)} 个 bucket，"
+                  f"处理 {len(group_members)} 个变体")
+
+            # ── ⑥ 逐个匹配变体 + 调用 pricehistory API ──
+            for member in group_members:
+                item_id = member["item_id"]
+                buff_item_name = member["buff_item_name"]
+                target_set = set(member["target_dates"])
+
+                props = _parse_buff_item_properties(buff_item_name)
+                matched = _match_bucket(buckets, props)
+                if not matched and initial_fallback_id:
+                    for bk in buckets:
+                        if bk.get("bucket_id") == initial_fallback_id:
+                            matched = bk
+                            break
+
+                if not matched:
+                    _last_error_context = {
+                        "type": "batch_bucket_match_failed",
+                        "item_id": item_id,
+                        "buff_item_name": buff_item_name,
+                        "buff_props": props,
+                        "available_buckets": [
+                            b.get("localized_name") for b in buckets[:20]
+                        ],
+                        "detail": "该变体在 Steam listing 中无对应 bucket",
+                    }
+                    print(f"[Steam][批] ❌ 未匹配: {buff_item_name}")
+                    continue
+
+                bucket_name = matched.get("localized_name", "")
+                bucket_min_price = matched.get("min_price")
+                print(f"[Steam][批] ✅ {buff_item_name} → {bucket_name}")
+
+                price_history = _fetch_price_history(
+                    steam_page, bucket_name, target_set)
+
+                steam_sold_count = sum(r.volume for r in price_history)
+
+                if bucket_min_price is not None:
+                    try:
+                        steam_current_price = float(bucket_min_price) / 100.0
+                    except (ValueError, TypeError):
+                        steam_current_price = None
+                else:
+                    steam_current_price = None
+                if steam_current_price is None and price_history:
+                    steam_current_price = (
+                        sum(r.price for r in price_history) / len(price_history))
+
+                results[item_id] = {
+                    "steam_url": steam_url,
+                    "market_hash_name": bucket_name,
+                    "steam_price": steam_current_price,
+                    "steam_sold_count": steam_sold_count,
+                    "steam_price_history": price_history,
+                    "date_records": [
+                        {"date": r.date.isoformat(), "steam_price": r.price,
+                         "steam_volume": r.volume}
+                        for r in price_history
+                    ],
+                }
+
+            if steam_page:
+                try:
+                    steam_page.close()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            import traceback
+            _last_error = f"Steam 批处理异常: {e}"
+            _last_error_context = {
+                "type": "batch_exception",
+                "exception": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+            }
+            print(f"[Steam][批] {_last_error}")
+            traceback.print_exc()
+        finally:
+            browser.close()
+
+    return results
+
+
+def _click_and_get_steam_page(page, context, btn):
+    """打开 Steam 页面，支持 3 种方式（依次尝试）：
+    1. 从按钮 href 直接导航（绕过验证码遮罩层）
+    2. dispatchEvent 点击（绕过验证码遮罩层，但可能被弹窗拦截）
+    3. 当前标签页降级（BUFF 在当前标签页跳转）
+    """
+    # ── 方式1：从按钮 href 直接导航到 Steam（最可靠，绕过所有遮罩层） ──
+    try:
+        href = btn.get_attribute("href")
+        if href:
+            if not href.startswith("http"):
+                href = "https:" + href if href.startswith("//") else "https://buff.163.com" + href
+            if "steamcommunity.com/market" in href or "steampowered.com/market" in href:
+                print(f"[Steam] 方式1: 直接导航到 Steam URL")
+                sp = context.new_page()
+                sp.goto(href, timeout=60000)
+                return sp
+    except Exception as e:
+        print(f"[Steam] 方式1 失败: {e}")
+
+    # ── 方式2：dispatchEvent 点击（绕过验证码遮罩层） ──
+    try:
+        with context.expect_page(timeout=15000) as new_page_event:
+            btn.dispatchEvent("click")
+        sp = new_page_event.value
+        try:
+            sp.wait_for_load_state("networkidle", timeout=60000)
+        except Exception:
+            pass
+        if "steamcommunity.com/market" in sp.url.lower() or "steampowered.com/market" in sp.url.lower():
+            print(f"[Steam] 方式2: dispatchEvent 打开新标签页")
+            return sp
+        try:
+            sp.close()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Steam] 方式2 未生效 ({type(e).__name__})，尝试当前标签页降级...")
+
+    # ── 方式3：当前标签页降级 ──
+    sleep_random(2.0, 3.0)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    current_url = page.url
+    if "steamcommunity.com/market" in current_url or "steampowered.com/market" in current_url:
+        print(f"[Steam] 方式3: 当前标签页已跳转到 Steam")
+        return page
+
+    print(f"[Steam] ❌ 三种方式均无法打开 Steam 页面（当前 URL: {current_url[:100]}）")
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -548,19 +980,23 @@ def diagnose_steam_extraction(item_id: str, target_dates: List[date],
                             f"目标日期 (Step2日期-7天): {sorted(target_dates)}"})
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
-        context = browser.new_context()
+        browser = p.chromium.launch(headless=True, proxy=config.PROXY_CONFIG)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="zh-CN",
+        )
 
-        # 加载 Steam cookies 优先（与主函数保持一致）
+        # 加载 cookies（与主函数保持一致）
         cookie_details = []
         steam_cookies = _load_cookies_from(config.STEAM_COOKIE_PATH)
         label_steam = config.STEAM_COOKIE_PATH.split("/")[-1].split("\\")[-1]
         if steam_cookies:
-            for c in steam_cookies:
-                try:
-                    context.add_cookies([c])
-                except Exception:
-                    pass
+            _try_add_cookies(context, steam_cookies, "Steam(diag)")
             names = [c.get("name") for c in steam_cookies if c.get("name")]
             cookie_details.append(f"{label_steam}: {len(steam_cookies)} cookies ({', '.join(names[:5])}...)")
         else:
@@ -569,11 +1005,7 @@ def diagnose_steam_extraction(item_id: str, target_dates: List[date],
         buff_cookies = _load_cookies_from(config.COOKIE_PATH)
         label_buff = config.COOKIE_PATH.split("/")[-1].split("\\")[-1]
         if buff_cookies:
-            for c in buff_cookies:
-                try:
-                    context.add_cookies([c])
-                except Exception:
-                    pass
+            _try_add_cookies(context, buff_cookies, "BUFF(diag)")
             names = [c.get("name") for c in buff_cookies if c.get("name")]
             cookie_details.append(f"{label_buff}: {len(buff_cookies)} cookies ({', '.join(names[:5])}...)")
         else:
@@ -618,11 +1050,15 @@ def diagnose_steam_extraction(item_id: str, target_dates: List[date],
             steps.append({"name": "③ 查找Steam按钮", "ok": True,
                           "detail": f"找到按钮: '{btn_text.strip()}'"})
 
-            # —— 步骤4：点击 Steam 按钮 ——
-            with context.expect_page(timeout=15000) as new_page_event:
-                btn.click()
+            # —— 步骤4：点击 Steam 按钮（支持新标签页/当前标签页） ——
+            steam_page = _click_and_get_steam_page(page, context, btn)
+            if steam_page is None:
+                steps.append({"name": "④ 打开Steam页面", "ok": False,
+                              "detail": f"无法打开 Steam 页面（当前 URL: {page.url[:100]}）"})
+                browser.close()
+                return {"steps": steps, "price_history": [], "steam_url": "",
+                        "market_hash_name": "", "tmp_dir": tmp_dir}
 
-            steam_page = new_page_event.value
             steam_url = steam_page.url
             market_hash_name = _extract_market_hash_name(steam_url) or ""
 

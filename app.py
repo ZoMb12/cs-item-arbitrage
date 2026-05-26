@@ -40,16 +40,16 @@ with st.sidebar:
 
     target_date = st.date_input("目标日期", value=config.DEFAULT_TARGET_DATE)
     stable_days = st.number_input(
-        "价格稳定考察天数", min_value=1, max_value=90, value=config.DEFAULT_STABLE_DAYS
+        "价格稳定考察天数", min_value=1, max_value=90, value=config.DEFAULT_STABLE_DAYS, key="stable_days_v2"
     )
     volatility_threshold = st.slider(
         "价格波动阈值 (%)", min_value=1, max_value=30, value=5
     ) / 100.0
 
     st.divider()
-    st.subheader("汇率转换")
+    st.subheader("卡价转换比")
     conversion_rate = st.number_input(
-        "美元 → 人民币 汇率",
+        "卡价转换比（美元 → 人民币）",
         min_value=0.1, max_value=20.0, value=5.0, step=0.01,
         help="用于将 Steam 美元价格转换为人民币，与 BUFF 价格进行对比",
     )
@@ -110,23 +110,27 @@ with st.sidebar:
         f"配置预览：\n"
         f"- 目标日期：{target_date}\n"
         f"- 考察 {stable_days} 天价格波动（≤{volatility_threshold * 100:.0f}%）\n"
-        f"- USD→CNY 汇率：{conversion_rate}\n"
+        f"- 卡价转换比（USD→CNY）：{conversion_rate}\n"
         f"- 品类：{'、'.join(category_names) if category_names else '全部/不限'}\n"
         f"- 目标 {target_count} 件 | 最低 ¥{min_price} | 在售≥{min_volume}"
     )
 
 
 # ---------- 一键获取：执行全部四步 ----------
-def _log_error(step: int, item_id: str, item_name: str, error: str):
-    """记录一条错误到 session_state.error_log。"""
+def _log_error(step: int, item_id: str, item_name: str, error: str,
+               context: dict = None):
+    """记录一条错误到 session_state.error_log，含可选的现场上下文。"""
     from datetime import datetime as _dt
-    st.session_state.error_log.append({
+    entry = {
         "step": step,
         "item_id": item_id,
         "item_name": item_name[:60] if item_name else "",
         "error": error,
         "time": _dt.now().strftime("%H:%M:%S"),
-    })
+    }
+    if context:
+        entry["context"] = context
+    st.session_state.error_log.append(entry)
 
 
 def _clear_downstream_steps(from_step: int):
@@ -147,7 +151,7 @@ def _clear_downstream_steps(from_step: int):
 
 
 def _show_error_log():
-    """在页面上展示错误日志 expander。"""
+    """在页面上展示错误日志 expander，含可展开的上下文细节。"""
     errors = st.session_state.get("error_log", [])
     if not errors:
         return
@@ -157,7 +161,24 @@ def _show_error_log():
             icon = "❌"
             step_label = step_names.get(e["step"], f"Step{e['step']}")
             item_label = f" [{e['item_name']}]" if e["item_name"] else ""
-            st.caption(f"{icon} **Step{e['step']}·{step_label}**{item_label} — {e['error']}  `{e['time']}`")
+            ctx = e.get("context")
+            ctx_summary = ""
+            if ctx:
+                etype = ctx.get("type", "")
+                detail = ctx.get("detail", "")
+                ctx_summary = f" [{etype}] {detail[:60]}"
+            st.caption(
+                f"{icon} **Step{e['step']}·{step_label}**{item_label}"
+                f" — {e['error']}{ctx_summary}  `{e['time']}`"
+            )
+            # 展开上下文详情
+            if ctx:
+                with st.status("", expanded=False):
+                    for k, v in ctx.items():
+                        val = str(v)
+                        if len(val) > 300:
+                            val = val[:300] + "..."
+                        st.code(f"{k}: {val}")
 
 
 def _execute_step1(target_date, target_count, categories, min_price, min_volume, run_id=None):
@@ -180,7 +201,9 @@ def _execute_step1(target_date, target_count, categories, min_price, min_volume,
 def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
     filtered = st.session_state.filtered_items
     stable = []
-    for item in filtered:
+    total = len(filtered)
+    for idx, item in enumerate(filtered):
+        st.write(f"  [{idx+1}/{total}] 正在获取 {item.name} 的价格历史…")
         start = target_date - timedelta(days=stable_days)
         history = get_price_history(item.item_id, start, target_date)
         item._debug_history_len = len(history)
@@ -189,17 +212,26 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
             item._debug_min_price = min(prices)
             item._debug_max_price = max(prices)
             item._debug_volatility = (max(prices) - min(prices)) / (sum(prices)/len(prices)) if sum(prices) > 0 else 0
+            st.write(f"    价格记录: {len(history)} 条, 范围 ¥{min(prices):.2f} ~ ¥{max(prices):.2f}, "
+                     f"波动 {item._debug_volatility*100:.1f}%")
+            for r in history[:5]:
+                st.write(f"      · {r.date.isoformat()}: ¥{r.price:.2f}")
+            if len(history) > 5:
+                st.write(f"      ... 及 {len(history)-5} 条更多记录")
         if is_price_stable(history, volatility_threshold):
             item.price_history = history
             stable.append(item)
+            st.write(f"    ✅ 通过 (波动 {item._debug_volatility*100:.1f}% ≤ {volatility_threshold*100:.0f}%)")
         else:
             if len(history) == 0:
                 item._debug_fail_reason = "无价格数据"
                 _log_error(2, item.item_id, item.name, "BUFF价格历史为空")
+                st.write(f"    ❌ 未通过: 无价格数据")
             else:
                 vol = item._debug_volatility
                 item._debug_fail_reason = f"波动 {vol*100:.1f}% > {volatility_threshold*100:.0f}%"
                 _log_error(2, item.item_id, item.name, item._debug_fail_reason)
+                st.write(f"    ❌ 未通过: 波动 {vol*100:.1f}% > 阈值 {volatility_threshold*100:.0f}%")
     st.session_state.stable_items = stable
     st.session_state.stage2_done = True
     if run_id:
@@ -209,22 +241,69 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
 def _execute_step3(run_id=None):
     stable = st.session_state.stable_items
     steam_data = {}
-    for i, item in enumerate(stable):
-        target_dates = sorted(set(
-            r.date - timedelta(days=7) for r in item.price_history
-        ))
-        data = get_steam_market_data(item.item_id, target_dates, item.name)
-        if data:
-            steam_data[item.item_id] = data
-            item.steam_url = data.get("steam_url")
-            item.steam_price = data.get("steam_price")
-            item.steam_sold_count = data.get("steam_sold_count", 0)
-            item.steam_price_history = data.get("steam_price_history", [])
-        else:
-            reason = _steam.get_last_steam_error() or "Steam数据获取失败（未知原因）"
-            _log_error(3, item.item_id, item.name, reason)
-        if i < len(stable) - 1:
+
+    # 按基础皮肤名分组，同组共用一次 Steam 页面调度
+    groups = _steam.group_by_skin_name(stable)
+    group_count = len(groups)
+    group_idx = 0
+
+    for base_name, group_items in groups.items():
+        group_idx += 1
+        st.write(f"  ── [{group_idx}/{group_count}] 皮肤组: {base_name} "
+                 f"（{len(group_items)} 个变体）──")
+
+        # 准备批处理输入
+        group_members = []
+        for item in group_items:
+            target_dates = sorted(set(
+                r.date - timedelta(days=7) for r in item.price_history
+            ))
+            group_members.append({
+                "item_id": item.item_id,
+                "buff_item_name": item.name,
+                "target_dates": target_dates,
+            })
+
+        # 批处理：一次 BUFF + 一次 Steam 获取所有变体数据
+        batch_results = _steam.get_steam_market_data_batch(
+            representative_item_id=group_items[0].item_id,
+            group_members=group_members,
+        )
+
+        # 更新每个变体的数据
+        for item in group_items:
+            data = batch_results.get(item.item_id)
+            if data:
+                steam_data[item.item_id] = data
+                item.steam_url = data.get("steam_url")
+                item.steam_price = data.get("steam_price")
+                item.steam_sold_count = data.get("steam_sold_count", 0)
+                item.steam_price_history = data.get("steam_price_history", [])
+                steam_price_str = f"${item.steam_price:.2f}" if item.steam_price else "N/A"
+                st.write(f"    ✅ {item.name}: Steam {steam_price_str}, "
+                         f"售出 {item.steam_sold_count} 件")
+                if item.steam_price_history:
+                    st.write(f"    价格历史:")
+                    for r in item.steam_price_history[:10]:
+                        st.write(f"      · {r.date.isoformat()}: ${r.price:.2f}, "
+                                 f"销量 {r.volume} 件")
+                    if len(item.steam_price_history) > 10:
+                        st.write(f"      ... 及 {len(item.steam_price_history)-10} 条")
+                date_records = data.get("date_records", [])
+                if date_records:
+                    st.write(f"    各日期节点:")
+                    for dr in date_records:
+                        st.write(f"      · {dr['date']}: ${dr['steam_price']:.2f}, "
+                                 f"销量 {dr['steam_volume']} 件")
+            else:
+                reason = _steam.get_last_steam_error() or "Steam数据获取失败"
+                ctx = _steam.get_last_steam_error_context()
+                _log_error(3, item.item_id, item.name, reason, context=ctx)
+                st.write(f"    ❌ {item.name}: 获取失败 - {reason}")
+
+        if group_idx < group_count:
             sleep_random(2.0, 4.0)
+
     st.session_state.steam_data = steam_data
     st.session_state.stage3_done = True
     if run_id:
@@ -537,45 +616,108 @@ with tabs[0]:
             st.session_state.stage4_done = False
             st.session_state.arbitrage_results = {}
             with st.status("第1步/共4步：BUFF初步筛选…", expanded=True) as status:
-                st.write("正在从 BUFF 市场抓取饰品列表…")
+                categories_label = '、'.join(category_names) if category_names else '全部/不限'
+                st.write("### 正在从 BUFF 市场抓取饰品列表…")
+                st.write(f"**筛选条件:**")
+                st.write(f"  · 品类: {categories_label}")
+                st.write(f"  · 目标数量: {target_count} 件")
+                st.write(f"  · 最低价格: ¥{min_price}")
+                st.write(f"  · 最低在售: {min_volume} 件")
                 _execute_step1(target_date, target_count, category_values,
                                min_price, min_volume, run_id)
                 raw = st.session_state.raw_items
                 filtered = st.session_state.filtered_items
-                st.write(f"原始获取 {len(raw)} 条 → 初步过滤（在售>100，价格>20元）后 {len(filtered)} 条")
+                st.write(f"---")
+                st.write(f"**抓取结果:**")
+                st.write(f"  · BUFF 原始获取: {len(raw)} 条")
+                st.write(f"  · 初步过滤（在售>{min_volume}，价格>¥{min_price}）: {len(filtered)} 条")
+                if filtered:
+                    st.write(f"**已获取饰品列表:**")
+                    for it in filtered[:20]:
+                        st.write(f"  · {it.name}: ¥{it.buff_price:.2f}, 在售 {it.volume} 件")
+                    if len(filtered) > 20:
+                        st.write(f"  ... 及 {len(filtered)-20} 件更多")
                 status.update(label=f"✅ 第1步完成：BUFF初步筛选 — {len(filtered)} 条通过", state="complete")
             progress_bar.progress(0.25)
 
             # Step 2
             with st.status("第2步/共4步：价格稳定性筛选…", expanded=True) as status:
                 if st.session_state.filtered_items:
-                    st.write(f"对 {len(st.session_state.filtered_items)} 个饰品逐个获取价格历史…")
+                    st.write(f"### 正在对 {len(st.session_state.filtered_items)} 个饰品逐个检查价格稳定性…")
+                    st.write(f"**参数:** 考察 {stable_days} 天, 波动阈值 ≤ {volatility_threshold*100:.0f}%")
+                    st.write(f"---")
                     _execute_step2(target_date, stable_days, volatility_threshold, run_id)
                 stable = st.session_state.stable_items
-                st.write(f"波动 ≤ {volatility_threshold * 100:.0f}% 的饰品：{len(stable)} / {len(filtered)} 条")
+                st.write(f"---")
+                st.write(f"**结果汇总:**")
+                st.write(f"  · 通过（波动 ≤ {volatility_threshold*100:.0f}%）: {len(stable)} 条")
+                fail_count = len(st.session_state.filtered_items) - len(stable)
+                st.write(f"  · 未通过: {fail_count} 条")
+                if stable:
+                    st.write(f"**已筛选通过的稳定饰品:**")
+                    for item in stable:
+                        st.write(f"  · {item.name}: ¥{item.buff_price:.2f}, "
+                                 f"波动 {item._debug_volatility*100:.1f}%")
                 status.update(label=f"✅ 第2步完成：价格稳定性筛选 — {len(stable)} 条通过", state="complete")
             progress_bar.progress(0.5)
 
             # Step 3
             with st.status("第3步/共4步：Steam市场数据获取…", expanded=True) as status:
                 if st.session_state.stable_items:
-                    st.write(f"正在对 {len(st.session_state.stable_items)} 个饰品打开浏览器获取 Steam 数据…")
+                    st.write(f"### 正在对 {len(st.session_state.stable_items)} 个饰品抓取 Steam 市场数据…")
+                    st.write(f"**说明:** 每个饰品会打开 Steam 市场页面，匹配对应磨损/StatTrak 变体，")
+                    st.write(f"获取历史售价及已售数量")
+                    st.write(f"---")
                     _execute_step3(run_id)
                 steam_data = st.session_state.steam_data
                 fail_count = len(stable) - len(steam_data)
-                st.write(f"成功获取：{len(steam_data)} / {len(stable)} 条"
-                         + (f"，失败 {fail_count} 条" if fail_count > 0 else ""))
+                st.write(f"---")
+                st.write(f"**结果汇总:**")
+                st.write(f"  · 成功获取 Steam 数据: {len(steam_data)} / {len(stable)} 条")
+                if fail_count > 0:
+                    st.write(f"  · 获取失败: {fail_count} 条")
+                if steam_data:
+                    st.write(f"**已获取数据列表:**")
+                    for sid, data in steam_data.items():
+                        item = next((it for it in stable if it.item_id == sid), None)
+                        name = item.name if item else sid
+                        sp = data.get("steam_price")
+                        sc = data.get("steam_sold_count", 0)
+                        sp_str = f"${sp:.2f}" if sp else "N/A"
+                        st.write(f"  · {name}: Steam {sp_str}, 售出 {sc} 件")
                 status.update(label=f"✅ 第3步完成：Steam数据 — {len(steam_data)}/{len(stable)} 条", state="complete")
             progress_bar.progress(0.75)
 
             # Step 4
             with st.status("第4步/共4步：套利对比分析…", expanded=True) as status:
+                stable = st.session_state.stable_items
+                st.write(f"### 正在对 {len(stable)} 个饰品进行 BUFF vs Steam 套利对比…")
+                st.write(f"**卡价转换比:** 1 USD = {conversion_rate} CNY")
+                st.write(f"**判定规则:** BUFF 均价 > Steam 转换均价 = 目标饰品")
+                st.write(f"---")
                 if st.session_state.steam_data:
                     _execute_step4(conversion_rate, run_id)
                 arb = st.session_state.arbitrage_results
-                target_count = sum(1 for v in arb.values() if v.get("is_target"))
-                st.write(f"发现 {target_count} 个目标饰品（BUFF均价 > Steam转换均价）")
-                status.update(label=f"✅ 第4步完成：套利对比 — {target_count} 个目标", state="complete")
+                found = sum(1 for v in arb.values() if v.get("is_target"))
+                st.write(f"---")
+                st.write(f"**结果汇总:**")
+                st.write(f"  · 有可对比数据的饰品: {len(arb)} 条")
+                st.write(f"  · 目标饰品（BUFF均价 > Steam转换均价）: {found} 个")
+                if arb:
+                    st.write(f"**各饰品对比详情:**")
+                    for sid, ar_data in arb.items():
+                        item = next((it for it in st.session_state.stable_items if it.item_id == sid), None)
+                        name = item.name if item else sid
+                        label = "🎯 目标" if ar_data.get("is_target") else "未达标"
+                        st.write(f"  · {name}: BUFF ¥{ar_data['avg_buff_price']:.2f} vs "
+                                 f"Steam ¥{ar_data['avg_steam_cny']:.2f}, "
+                                 f"差¥{ar_data['avg_diff']:+.2f} — {label}")
+                        for p in ar_data.get("date_pairs", []):
+                            icon = "✅" if p["is_target"] else "❌"
+                            st.write(f"      {icon} {p['buff_date']}: BUFF ¥{p['buff_price']:.2f} "
+                                     f"vs Steam ${p['steam_price_usd']:.2f}→¥{p['steam_price_cny']:.2f} "
+                                     f"(差¥{p['diff']:+.2f})")
+                status.update(label=f"✅ 第4步完成：套利对比 — {found} 个目标", state="complete")
             progress_bar.progress(1.0)
 
             progress_bar.empty()
@@ -966,7 +1108,7 @@ with tabs[0]:
             # =====================================================================
             st.divider()
             st.subheader("第四步：BUFF vs Steam 价格对比")
-            st.caption('对每个饰品按日期节点配对，将Steam价格乘上汇率转换为人民币，与BUFF价格对比。'
+            st.caption('对每个饰品按日期节点配对，将Steam价格乘上卡价转换比转换为人民币，与BUFF价格对比。'
                        '当BUFF均价高于Steam转换均价时，标记为目标饰品。')
 
             if st.session_state.stage3_done and st.session_state.steam_data:

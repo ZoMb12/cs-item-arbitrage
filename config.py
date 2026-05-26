@@ -2,7 +2,7 @@ import os
 from datetime import date
 
 DEFAULT_TARGET_DATE = date.today()
-DEFAULT_STABLE_DAYS = 15
+DEFAULT_STABLE_DAYS = 24
 DEFAULT_VOLATILITY_THRESHOLD = 0.05
 DEFAULT_MIN_VOLUME = 100
 DEFAULT_MIN_PRICE = 20.0
@@ -22,6 +22,11 @@ CATEGORY_OPTIONS = {
     "探员": "type_customplayer",
     "其他": "other",
 }
+
+# 代理配置（Clash/V2Ray 等本地代理，用于访问被墙的 Steam）
+PROXY_SERVER = "http://127.0.0.1:7890"
+PROXY_BYPASS = "buff.163.com,.163.com,.qq.com,.aliyuncs.com,.cn"
+PROXY_CONFIG = {"server": PROXY_SERVER, "bypass": PROXY_BYPASS}
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(_BASE_DIR, "storage")
