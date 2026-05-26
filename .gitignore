@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.db
+*.sqlite
+*.sqlite3
+storage/
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+.claude/
+# 临时调试文件
+*.json
+*.txt
+!requirements.txt

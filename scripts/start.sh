@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "正在启动 CS饰品搬砖选品助手..."
+streamlit run app.py
