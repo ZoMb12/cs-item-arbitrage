@@ -1,3 +1,4 @@
+import io
 from datetime import date, timedelta
 
 import pandas as pd
@@ -115,6 +116,28 @@ with st.sidebar:
         f"- 目标 {target_count} 件 | 最低 ¥{min_price} | 在售≥{min_volume}"
     )
 
+    # 分步模式参数变更检测
+    _snap = st.session_state.get("_param_snapshot")
+    if _snap and st.session_state.get("one_click_mode") is None:
+        affected = []
+        if st.session_state.get("stage1_done"):
+            if (category_names != _snap.get("category_names") or
+                target_count != _snap.get("target_count") or
+                min_price != _snap.get("min_price") or
+                min_volume != _snap.get("min_volume")):
+                affected.append("Step ① 品类/数量/最低价/在售量")
+        if st.session_state.get("stage2_done"):
+            if (str(target_date) != _snap.get("target_date") or
+                stable_days != _snap.get("stable_days") or
+                volatility_threshold != _snap.get("volatility_threshold")):
+                affected.append("Step ② 目标日期/考察天数/波动阈值")
+        if st.session_state.get("stage4_done"):
+            if conversion_rate != _snap.get("conversion_rate"):
+                affected.append("Step ④ 汇率转换比")
+        if affected:
+            st.warning("参数已修改，影响已完成步骤：\n" + "\n".join(f"• {a}" for a in affected) +
+                       "\n建议重新执行受影响的步骤")
+
 
 # ---------- 一键获取：执行全部四步 ----------
 def _log_error(step: int, item_id: str, item_name: str, error: str,
@@ -181,6 +204,20 @@ def _show_error_log():
                         st.code(f"{k}: {val}")
 
 
+def _snapshot_params():
+    """保存当前 sidebar 参数快照，用于分步模式下检测参数变更。"""
+    st.session_state._param_snapshot = {
+        "category_names": list(category_names) if category_names else [],
+        "target_count": target_count,
+        "min_price": min_price,
+        "min_volume": min_volume,
+        "target_date": str(target_date),
+        "stable_days": stable_days,
+        "volatility_threshold": volatility_threshold,
+        "conversion_rate": conversion_rate,
+    }
+
+
 def _execute_step1(target_date, target_count, categories, min_price, min_volume, run_id=None):
     try:
         st.session_state.raw_items = get_items_on_date(
@@ -234,6 +271,7 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
                 item._debug_fail_reason = f"波动 {vol*100:.1f}% > {volatility_threshold*100:.0f}%"
                 _log_error(2, item.item_id, item.name, item._debug_fail_reason)
                 st.write(f"    ❌ 未通过: 波动 {vol*100:.1f}% > 阈值 {volatility_threshold*100:.0f}%")
+    progress_bar.progress(1.0, text="完成!")
     progress_bar.empty()
     st.session_state.stable_items = stable
     st.session_state.stage2_done = True
@@ -373,6 +411,7 @@ def _execute_step4(conversion_rate, run_id=None):
     st.session_state.stage4_done = True
     if run_id:
         db.save_step4(run_id, stable, arbitrage_results)
+        db.finish_run(run_id)
 
 
 # ---------- 主区域 ----------
@@ -388,6 +427,7 @@ with tabs[0]:
         "one_click_mode": None,  # None | "running" | "done"
         "current_run_id": None,  # DB run id for persistence
         "error_log": [],  # [{step, item_id, item_name, error, time}]
+        "_param_snapshot": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -411,6 +451,32 @@ with tabs[0]:
         if arbitrage_results:
             target_items = [it for it in stable if arbitrage_results.get(it.item_id, {}).get("is_target")]
             st.header(f"🎯 发现 {len(target_items)} 个目标饰品")
+
+            # ---- 导出Excel ----
+            if target_items:
+                buf = io.BytesIO()
+                export_rows = []
+                for item in target_items:
+                    ar = arbitrage_results.get(item.item_id, {})
+                    for p in ar.get("date_pairs", []):
+                        if p["is_target"]:
+                            export_rows.append({
+                                "饰品名称": item.name,
+                                "BUFF日期": str(p["buff_date"]),
+                                "BUFF价格(¥)": round(p["buff_price"], 2),
+                                "Steam日期": str(p["steam_date"]),
+                                "Steam价格($)": round(p["steam_price_usd"], 2),
+                            })
+                if export_rows:
+                    df_export = pd.DataFrame(export_rows)
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        df_export.to_excel(writer, index=False, sheet_name="目标饰品")
+                    st.download_button(
+                        label="📥 导出Excel",
+                        data=buf.getvalue(),
+                        file_name=f"arbitrage_targets_{date.today().isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
             # ---- 主结果表格 ----
             rows = []
@@ -616,6 +682,7 @@ with tabs[0]:
             st.session_state.one_click_mode = "running"
             st.session_state.error_log = []
             category_values = [config.CATEGORY_OPTIONS[n] for n in category_names if n != "全部/不限"]
+            _snapshot_params()
             run_id = db.create_run(target_date, stable_days, volatility_threshold,
                                    conversion_rate, target_count)
             st.session_state.current_run_id = run_id
@@ -771,6 +838,7 @@ with tabs[0]:
                     st.session_state.error_log = []
                     st.session_state.one_click_mode = None
                     category_values = [config.CATEGORY_OPTIONS[n] for n in category_names if n != "全部/不限"]
+                    _snapshot_params()
                     run_id = db.create_run(target_date, stable_days, volatility_threshold,
                                            conversion_rate, target_count)
                     st.session_state.current_run_id = run_id
@@ -795,6 +863,7 @@ with tabs[0]:
                     st.session_state.error_log = []
                     st.session_state.one_click_mode = None
                     category_values = [config.CATEGORY_OPTIONS[n] for n in category_names if n != "全部/不限"]
+                    _snapshot_params()
                     run_id = db.create_run(target_date, stable_days, volatility_threshold,
                                            conversion_rate, target_count)
                     st.session_state.current_run_id = run_id
