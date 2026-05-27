@@ -27,6 +27,7 @@ from playwright.sync_api import sync_playwright
 # 最后一次错误的详情，供 app.py 错误日志使用
 _last_error: str = ""
 _last_error_context: dict = {}  # 结构化错误现场信息（URL、标题、截图路径等）
+_batch_errors: dict = {}  # 批处理时按 item_id 记录的失败 {item_id: {"error": str, "context": dict}}
 
 import config
 from core.buff_scraper import (
@@ -253,13 +254,19 @@ def group_by_skin_name(items: list) -> dict:
 # Step 3 核心
 # ═══════════════════════════════════════════════════════════════════
 
-def get_last_steam_error() -> str:
-    """返回最后一次 Steam 数据获取的失败原因，供调用方记录错误日志。"""
+def get_last_steam_error(item_id=None) -> str:
+    """返回最后一次 Steam 数据获取的失败原因，供调用方记录错误日志。
+    传入 item_id 时优先返回批处理中该饰品的独立错误。"""
+    if item_id and item_id in _batch_errors:
+        return _batch_errors[item_id]["error"]
     return _last_error
 
 
-def get_last_steam_error_context() -> dict:
-    """返回最后一次 Steam 数据获取的结构化错误现场信息。"""
+def get_last_steam_error_context(item_id=None) -> dict:
+    """返回最后一次 Steam 数据获取的结构化错误现场信息。
+    传入 item_id 时优先返回批处理中该饰品的独立上下文。"""
+    if item_id and item_id in _batch_errors:
+        return _batch_errors[item_id]["context"]
     return _last_error_context
 
 
@@ -559,8 +566,9 @@ def get_steam_market_data_batch(
                    steam_sold_count, steam_price_history, date_records},
          ...}
     """
-    global _last_error, _last_error_context
+    global _last_error, _last_error_context, _batch_errors
     _last_error_context = {}
+    _batch_errors.clear()
     goods_url = f"https://buff.163.com/goods/{representative_item_id}"
 
     with sync_playwright() as p:
@@ -681,15 +689,18 @@ def get_steam_market_data_batch(
                             break
 
                 if not matched:
-                    _last_error_context = {
-                        "type": "batch_bucket_match_failed",
-                        "item_id": item_id,
-                        "buff_item_name": buff_item_name,
-                        "buff_props": props,
-                        "available_buckets": [
-                            b.get("localized_name") for b in buckets[:20]
-                        ],
-                        "detail": "该变体在 Steam listing 中无对应 bucket",
+                    _batch_errors[item_id] = {
+                        "error": f"未匹配到Steam bucket (wear={props.get('wear')}, StatTrak={props.get('stattrak')})",
+                        "context": {
+                            "type": "batch_bucket_match_failed",
+                            "item_id": item_id,
+                            "buff_item_name": buff_item_name,
+                            "buff_props": props,
+                            "available_buckets": [
+                                b.get("localized_name") for b in buckets[:20]
+                            ],
+                            "detail": "该变体在 Steam listing 中无对应 bucket",
+                        },
                     }
                     print(f"[Steam][批] ❌ 未匹配: {buff_item_name}")
                     continue

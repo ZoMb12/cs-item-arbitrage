@@ -339,8 +339,8 @@ def _execute_step3(run_id=None):
                         st.write(f"      · {dr['date']}: ${dr['steam_price']:.2f}, "
                                  f"销量 {dr['steam_volume']} 件")
             else:
-                reason = _steam.get_last_steam_error() or "Steam数据获取失败"
-                ctx = _steam.get_last_steam_error_context()
+                reason = _steam.get_last_steam_error(item_id=item.item_id) or "Steam数据获取失败"
+                ctx = _steam.get_last_steam_error_context(item_id=item.item_id)
                 _log_error(3, item.item_id, item.name, reason, context=ctx)
                 st.write(f"    ❌ {item.name}: 获取失败 - {reason}")
                 st.session_state.failed_step3_items.append({
@@ -409,6 +409,7 @@ def _execute_step4(conversion_rate, run_id=None):
             }
     st.session_state.arbitrage_results = arbitrage_results
     st.session_state.stage4_done = True
+    st.session_state._run_conversion_rate = conversion_rate
     if run_id:
         db.save_step4(run_id, stable, arbitrage_results)
         db.finish_run(run_id)
@@ -428,6 +429,7 @@ with tabs[0]:
         "current_run_id": None,  # DB run id for persistence
         "error_log": [],  # [{step, item_id, item_name, error, time}]
         "_param_snapshot": None,
+        "_run_conversion_rate": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -444,6 +446,7 @@ with tabs[0]:
         steam_data = st.session_state.steam_data
         filtered = st.session_state.filtered_items
         raw = st.session_state.raw_items
+        _disp_rate = st.session_state.get("_run_conversion_rate", conversion_rate)
 
         st.success(f"一键获取完成！BUFF 原始 {len(raw)} 条 → 初步过滤 {len(filtered)} 条 "
                    f"→ 价格稳定 {len(stable)} 条 → Steam 数据 {len(steam_data)} 条")
@@ -485,7 +488,7 @@ with tabs[0]:
                 if ar:
                     date_details = "; ".join(
                         f"{p['buff_date']}: BUFF ¥{p['buff_price']:.2f} vs "
-                        f"Steam ${p['steam_price_usd']:.2f}×{conversion_rate}=¥{p['steam_price_cny']:.2f} "
+                        f"Steam ${p['steam_price_usd']:.2f}×{_disp_rate}=¥{p['steam_price_cny']:.2f} "
                         f"→ {'✅' if p['is_target'] else '❌'}差¥{p['diff']:+.2f}"
                         for p in ar["date_pairs"]
                     )
@@ -644,14 +647,14 @@ with tabs[0]:
                                     ))
                                 steam_hist = data["steam_price_history"]
                                 steam_dates = [r.date for r in steam_hist]
-                                steam_prices_cny = [r.price * conversion_rate for r in steam_hist]
+                                steam_prices_cny = [r.price * _disp_rate for r in steam_hist]
                                 fig.add_trace(go.Scatter(
                                     x=steam_dates, y=steam_prices_cny, name=f"{item.name} Steam→¥",
                                     mode="lines+markers", yaxis="y",
                                 ))
                                 title_suffix = " 🎯目标" if (ar and ar["is_target"]) else ""
                                 fig.update_layout(
-                                    title=f"{item.name} 价格对比 (1 USD = {conversion_rate} CNY){title_suffix}",
+                                    title=f"{item.name} 价格对比 (1 USD = {_disp_rate} CNY){title_suffix}",
                                     xaxis_title="日期", yaxis_title="价格 (¥)",
                                     hovermode="x unified",
                                 )
@@ -1115,7 +1118,7 @@ with tabs[0]:
                                         ok += 1
                                         retry_status.write(f"✅ {fi['buff_item_name']} 成功")
                                     else:
-                                        err = _steam.get_last_steam_error() or "失败"
+                                        err = _steam.get_last_steam_error(item_id=fi["item_id"]) or "失败"
                                         _log_error(3, fi["item_id"], fi["buff_item_name"], err)
                                         retry_status.write(f"❌ {fi['buff_item_name']} 失败")
                                 st.session_state.failed_step3_items = [
