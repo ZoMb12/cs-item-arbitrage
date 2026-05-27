@@ -856,6 +856,8 @@ def _extract_ssr_buckets(page) -> dict | None:
         raw = page.evaluate("""() => {
             if (!window.SSR || !window.SSR.loaderData) return null;
             // loaderData[3] 通常是 item listing 数据
+            // ⚠️ 远期风险: Steam 前端 SSR 结构调整可能导致 buckets 出现在不同索引甚至变换数据格式。
+            //   到时需更新此处遍历逻辑或改用其它字段定位。当前遍历 + try/except 有基本容错。
             for (var i = 0; i < window.SSR.loaderData.length; i++) {
                 try {
                     var d = JSON.parse(window.SSR.loaderData[i]);
