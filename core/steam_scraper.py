@@ -749,6 +749,38 @@ def get_steam_market_data_batch(
     return results
 
 
+def retry_steam_failed_items(failed_items: List[dict]) -> dict:
+    """独立重试之前 Step 3 失败的饰品，按皮肤名重新分组批处理。
+
+    Args:
+        failed_items: [{"item_id", "buff_item_name", "target_dates"}] 列表。
+
+    Returns:
+        {item_id: steam_data_dict, ...}（同 get_steam_market_data_batch）
+    """
+    if not failed_items:
+        return {}
+
+    # 按皮肤名重新分组
+    name_groups = {}
+    for fi in failed_items:
+        base_name = fi.get("base_skin_name") or _get_base_skin_name(
+            fi.get("buff_item_name", ""))
+        name_groups.setdefault(base_name, []).append(fi)
+
+    all_results = {}
+    total = len(name_groups)
+    for idx, (base_name, members) in enumerate(name_groups.items()):
+        print(f"[Steam][重试] [{idx+1}/{total}] 组: {base_name} ({len(members)}个变体)")
+        batch_results = get_steam_market_data_batch(
+            representative_item_id=members[0]["item_id"],
+            group_members=members,
+        )
+        all_results.update(batch_results)
+
+    return all_results
+
+
 def _click_and_get_steam_page(page, context, btn):
     """打开 Steam 页面，支持 3 种方式（依次尝试）：
     1. 从按钮 href 直接导航（绕过验证码遮罩层）

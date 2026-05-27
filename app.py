@@ -202,7 +202,9 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
     filtered = st.session_state.filtered_items
     stable = []
     total = len(filtered)
+    progress_bar = st.progress(0, text="准备开始...")
     for idx, item in enumerate(filtered):
+        progress_bar.progress((idx) / total, text=f"正在获取 ({idx+1}/{total}) {item.name[:40]}…")
         st.write(f"  [{idx+1}/{total}] 正在获取 {item.name} 的价格历史…")
         start = target_date - timedelta(days=stable_days)
         history = get_price_history(item.item_id, start, target_date)
@@ -232,6 +234,7 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
                 item._debug_fail_reason = f"波动 {vol*100:.1f}% > {volatility_threshold*100:.0f}%"
                 _log_error(2, item.item_id, item.name, item._debug_fail_reason)
                 st.write(f"    ❌ 未通过: 波动 {vol*100:.1f}% > 阈值 {volatility_threshold*100:.0f}%")
+    progress_bar.empty()
     st.session_state.stable_items = stable
     st.session_state.stage2_done = True
     if run_id:
@@ -241,6 +244,7 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
 def _execute_step3(run_id=None):
     stable = st.session_state.stable_items
     steam_data = {}
+    st.session_state.failed_step3_items = []
 
     # 按基础皮肤名分组，同组共用一次 Steam 页面调度
     groups = _steam.group_by_skin_name(stable)
@@ -262,6 +266,7 @@ def _execute_step3(run_id=None):
                 "item_id": item.item_id,
                 "buff_item_name": item.name,
                 "target_dates": target_dates,
+                "base_skin_name": base_name,
             })
 
         # 批处理：一次 BUFF + 一次 Steam 获取所有变体数据
@@ -300,6 +305,14 @@ def _execute_step3(run_id=None):
                 ctx = _steam.get_last_steam_error_context()
                 _log_error(3, item.item_id, item.name, reason, context=ctx)
                 st.write(f"    ❌ {item.name}: 获取失败 - {reason}")
+                st.session_state.failed_step3_items.append({
+                    "item_id": item.item_id,
+                    "buff_item_name": item.name,
+                    "target_dates": [
+                        r.date - timedelta(days=7) for r in item.price_history
+                    ],
+                    "base_skin_name": base_name,
+                })
 
         if group_idx < group_count:
             sleep_random(2.0, 4.0)
@@ -981,7 +994,67 @@ with tabs[0]:
                 steam_data = st.session_state.steam_data
                 stable = st.session_state.stable_items
                 success_count = len(steam_data)
+                failed_items = st.session_state.get("failed_step3_items", [])
+                fail_count = len(stable) - success_count
                 st.write(f"成功获取Steam市场数据：{success_count} / {len(stable)} 条")
+                if fail_count > 0:
+                    st.write(f"获取失败: {fail_count} 条")
+
+                # ── 重试失败饰品 ──
+                if failed_items:
+                    with st.expander(f"🔄 重试失败饰品（{len(failed_items)} 条）", expanded=True):
+                        st.markdown("以下饰品 Step 3 获取失败，可单独或批量重试：")
+                        for fi in failed_items:
+                            name = fi["buff_item_name"]
+                            col_a, col_b = st.columns([4, 1])
+                            with col_a:
+                                st.caption(f"{name}  (ID: {fi['item_id']})")
+                            with col_b:
+                                retry_key = f"retry_{fi['item_id']}"
+                                if st.button("重试", key=retry_key, use_container_width=True):
+                                    with st.spinner(f"正在重试 {name}..."):
+                                        result = _steam.get_steam_market_data(
+                                            fi["item_id"],
+                                            fi["target_dates"],
+                                            fi["buff_item_name"],
+                                        )
+                                    if result:
+                                        steam_data[fi["item_id"]] = result
+                                        st.success(f"✅ {name} 重试成功")
+                                        st.session_state.failed_step3_items = [
+                                            f for f in st.session_state.failed_step3_items
+                                            if f["item_id"] != fi["item_id"]
+                                        ]
+                                        st.rerun()
+                                    else:
+                                        err = _steam.get_last_steam_error() or "未知错误"
+                                        ctx = _steam.get_last_steam_error_context()
+                                        _log_error(3, fi["item_id"], name, err, context=ctx)
+                                        st.error(f"❌ {name} 重试失败: {err}")
+
+                        st.divider()
+                        if st.button("🔄 重试全部失败饰品", type="primary",
+                                      use_container_width=True, key="retry_all_failed"):
+                            with st.status("正在批量重试所有失败饰品...",
+                                           expanded=True) as retry_status:
+                                batch_result = _steam.retry_steam_failed_items(failed_items)
+                                ok = 0
+                                for fi in failed_items:
+                                    data = batch_result.get(fi["item_id"])
+                                    if data:
+                                        steam_data[fi["item_id"]] = data
+                                        ok += 1
+                                        retry_status.write(f"✅ {fi['buff_item_name']} 成功")
+                                    else:
+                                        err = _steam.get_last_steam_error() or "失败"
+                                        _log_error(3, fi["item_id"], fi["buff_item_name"], err)
+                                        retry_status.write(f"❌ {fi['buff_item_name']} 失败")
+                                st.session_state.failed_step3_items = [
+                                    f for f in failed_items
+                                    if f["item_id"] not in batch_result
+                                ]
+                                st.success(f"重试完成: {ok}/{len(failed_items)} 成功")
+                            st.rerun()
 
                 if steam_data:
                     rows = []
