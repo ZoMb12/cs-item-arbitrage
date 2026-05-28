@@ -203,6 +203,26 @@ def _show_error_log():
                             val = val[:300] + "..."
                         st.code(f"{k}: {val}")
 
+        # 导出诊断信息
+        import json as _json
+        _diag = []
+        for e in errors:
+            _diag.append({
+                "step": e["step"], "item_id": e.get("item_id", ""),
+                "item_name": e.get("item_name", ""), "error": e["error"],
+                "context": e.get("context", {}),
+            })
+        _diag_json = _json.dumps(_diag, ensure_ascii=False, indent=2,
+                                 default=str)
+        st.download_button(
+            "📋 导出诊断信息",
+            data=_diag_json,
+            file_name=f"error_diagnostic_{date.today().isoformat()}.json",
+            mime="application/json",
+            use_container_width=True,
+            help="导出所有错误日志及上下文，供开发者分析",
+        )
+
 
 def _snapshot_params():
     """保存当前 sidebar 参数快照，用于分步模式下检测参数变更。"""
@@ -240,37 +260,43 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
     stable = []
     total = len(filtered)
     progress_bar = st.progress(0, text="准备开始...")
-    for idx, item in enumerate(filtered):
-        progress_bar.progress((idx) / total, text=f"正在获取 ({idx+1}/{total}) {item.name[:40]}…")
-        st.write(f"  [{idx+1}/{total}] 正在获取 {item.name} 的价格历史…")
-        start = target_date - timedelta(days=stable_days)
-        history = get_price_history(item.item_id, start, target_date)
-        item._debug_history_len = len(history)
-        if history:
-            prices = [r.price for r in history]
-            item._debug_min_price = min(prices)
-            item._debug_max_price = max(prices)
-            item._debug_volatility = (max(prices) - min(prices)) / (sum(prices)/len(prices)) if sum(prices) > 0 else 0
-            st.write(f"    价格记录: {len(history)} 条, 范围 ¥{min(prices):.2f} ~ ¥{max(prices):.2f}, "
-                     f"波动 {item._debug_volatility*100:.1f}%")
-            for r in history[:5]:
-                st.write(f"      · {r.date.isoformat()}: ¥{r.price:.2f}")
-            if len(history) > 5:
-                st.write(f"      ... 及 {len(history)-5} 条更多记录")
-        if is_price_stable(history, volatility_threshold):
-            item.price_history = history
-            stable.append(item)
-            st.write(f"    ✅ 通过 (波动 {item._debug_volatility*100:.1f}% ≤ {volatility_threshold*100:.0f}%)")
-        else:
-            if len(history) == 0:
-                item._debug_fail_reason = "无价格数据"
-                _log_error(2, item.item_id, item.name, "BUFF价格历史为空")
-                st.write(f"    ❌ 未通过: 无价格数据")
+    try:
+        for idx, item in enumerate(filtered):
+            progress_bar.progress((idx) / total, text=f"正在获取 ({idx+1}/{total}) {item.name[:40]}…")
+            st.write(f"  [{idx+1}/{total}] 正在获取 {item.name} 的价格历史…")
+            start = target_date - timedelta(days=stable_days)
+            history = get_price_history(item.item_id, start, target_date)
+            item._debug_history_len = len(history)
+            if history:
+                prices = [r.price for r in history]
+                item._debug_min_price = min(prices)
+                item._debug_max_price = max(prices)
+                item._debug_volatility = (max(prices) - min(prices)) / (sum(prices)/len(prices)) if sum(prices) > 0 else 0
+                st.write(f"    价格记录: {len(history)} 条, 范围 ¥{min(prices):.2f} ~ ¥{max(prices):.2f}, "
+                         f"波动 {item._debug_volatility*100:.1f}%")
+                for r in history[:5]:
+                    st.write(f"      · {r.date.isoformat()}: ¥{r.price:.2f}")
+                if len(history) > 5:
+                    st.write(f"      ... 及 {len(history)-5} 条更多记录")
+            if is_price_stable(history, volatility_threshold):
+                item.price_history = history
+                stable.append(item)
+                st.write(f"    ✅ 通过 (波动 {item._debug_volatility*100:.1f}% ≤ {volatility_threshold*100:.0f}%)")
             else:
-                vol = item._debug_volatility
-                item._debug_fail_reason = f"波动 {vol*100:.1f}% > {volatility_threshold*100:.0f}%"
-                _log_error(2, item.item_id, item.name, item._debug_fail_reason)
-                st.write(f"    ❌ 未通过: 波动 {vol*100:.1f}% > 阈值 {volatility_threshold*100:.0f}%")
+                if len(history) == 0:
+                    item._debug_fail_reason = "无价格数据"
+                    _log_error(2, item.item_id, item.name, "BUFF价格历史为空")
+                    st.write(f"    ❌ 未通过: 无价格数据")
+                else:
+                    vol = item._debug_volatility
+                    item._debug_fail_reason = f"波动 {vol*100:.1f}% > {volatility_threshold*100:.0f}%"
+                    _log_error(2, item.item_id, item.name, item._debug_fail_reason)
+                    st.write(f"    ❌ 未通过: 波动 {vol*100:.1f}% > 阈值 {volatility_threshold*100:.0f}%")
+    except Exception as e:
+        import traceback
+        _log_error(2, "", "全部", f"Step 2 执行异常（已保留部分数据）: {e}")
+        st.write(f"  ❌ **Step 2 执行中断**: {e}，已处理 {len(stable)}/{total} 个饰品")
+        traceback.print_exc()
     progress_bar.progress(1.0, text="完成!")
     progress_bar.empty()
     st.session_state.stable_items = stable
@@ -279,81 +305,94 @@ def _execute_step2(target_date, stable_days, volatility_threshold, run_id=None):
         db.save_step2(run_id, filtered, stable)
 
 
-def _execute_step3(run_id=None):
+def _execute_step3(run_id=None, status=None):
     stable = st.session_state.stable_items
     steam_data = {}
     st.session_state.failed_step3_items = []
 
-    # 按基础皮肤名分组，同组共用一次 Steam 页面调度
-    groups = _steam.group_by_skin_name(stable)
-    group_count = len(groups)
-    group_idx = 0
+    try:
+        # 按基础皮肤名分组，同组共用一次 Steam 页面调度
+        groups = _steam.group_by_skin_name(stable)
+        group_count = len(groups)
+        group_idx = 0
 
-    for base_name, group_items in groups.items():
-        group_idx += 1
-        st.write(f"  ── [{group_idx}/{group_count}] 皮肤组: {base_name} "
-                 f"（{len(group_items)} 个变体）──")
+        for base_name, group_items in groups.items():
+            group_idx += 1
+            if status:
+                status.update(label=f"第3步/共4步：Steam市场数据获取… [{group_idx}/{group_count}] 组")
+            st.write(f"  ── [{group_idx}/{group_count}] 皮肤组: {base_name} "
+                     f"（{len(group_items)} 个变体）──")
 
-        # 准备批处理输入
-        group_members = []
-        for item in group_items:
-            target_dates = sorted(set(
-                r.date - timedelta(days=7) for r in item.price_history
-            ))
-            group_members.append({
-                "item_id": item.item_id,
-                "buff_item_name": item.name,
-                "target_dates": target_dates,
-                "base_skin_name": base_name,
-            })
-
-        # 批处理：一次 BUFF + 一次 Steam 获取所有变体数据
-        batch_results = _steam.get_steam_market_data_batch(
-            representative_item_id=group_items[0].item_id,
-            group_members=group_members,
-        )
-
-        # 更新每个变体的数据
-        for item in group_items:
-            data = batch_results.get(item.item_id)
-            if data:
-                steam_data[item.item_id] = data
-                item.steam_url = data.get("steam_url")
-                item.steam_price = data.get("steam_price")
-                item.steam_sold_count = data.get("steam_sold_count", 0)
-                item.steam_price_history = data.get("steam_price_history", [])
-                steam_price_str = f"${item.steam_price:.2f}" if item.steam_price else "N/A"
-                st.write(f"    ✅ {item.name}: Steam {steam_price_str}, "
-                         f"售出 {item.steam_sold_count} 件")
-                if item.steam_price_history:
-                    st.write(f"    价格历史:")
-                    for r in item.steam_price_history[:10]:
-                        st.write(f"      · {r.date.isoformat()}: ${r.price:.2f}, "
-                                 f"销量 {r.volume} 件")
-                    if len(item.steam_price_history) > 10:
-                        st.write(f"      ... 及 {len(item.steam_price_history)-10} 条")
-                date_records = data.get("date_records", [])
-                if date_records:
-                    st.write(f"    各日期节点:")
-                    for dr in date_records:
-                        st.write(f"      · {dr['date']}: ${dr['steam_price']:.2f}, "
-                                 f"销量 {dr['steam_volume']} 件")
-            else:
-                reason = _steam.get_last_steam_error(item_id=item.item_id) or "Steam数据获取失败"
-                ctx = _steam.get_last_steam_error_context(item_id=item.item_id)
-                _log_error(3, item.item_id, item.name, reason, context=ctx)
-                st.write(f"    ❌ {item.name}: 获取失败 - {reason}")
-                st.session_state.failed_step3_items.append({
+            # 准备批处理输入
+            group_members = []
+            for item in group_items:
+                target_dates = sorted(set(
+                    r.date - timedelta(days=7) for r in item.price_history
+                ))
+                group_members.append({
                     "item_id": item.item_id,
                     "buff_item_name": item.name,
-                    "target_dates": [
-                        r.date - timedelta(days=7) for r in item.price_history
-                    ],
+                    "target_dates": target_dates,
                     "base_skin_name": base_name,
                 })
 
-        if group_idx < group_count:
-            sleep_random(2.0, 4.0)
+            # 批处理：一次 BUFF + 一次 Steam 获取所有变体数据
+            batch_results = _steam.get_steam_market_data_batch(
+                representative_item_id=group_items[0].item_id,
+                group_members=group_members,
+            )
+
+            # 更新每个变体的数据
+            for item in group_items:
+                data = batch_results.get(item.item_id)
+                if data and data.get("steam_price_history"):
+                    steam_data[item.item_id] = data
+                    item.steam_url = data.get("steam_url")
+                    item.steam_price = data.get("steam_price")
+                    item.steam_sold_count = data.get("steam_sold_count", 0)
+                    item.steam_price_history = data.get("steam_price_history", [])
+                    steam_price_str = f"${item.steam_price:.2f}" if item.steam_price else "N/A"
+                    st.write(f"    ✅ {item.name}: Steam {steam_price_str}, "
+                             f"售出 {item.steam_sold_count} 件")
+                    if item.steam_price_history:
+                        st.write(f"    价格历史:")
+                        for r in item.steam_price_history[:10]:
+                            st.write(f"      · {r.date.isoformat()}: ${r.price:.2f}, "
+                                     f"销量 {r.volume} 件")
+                        if len(item.steam_price_history) > 10:
+                            st.write(f"      ... 及 {len(item.steam_price_history)-10} 条")
+                    date_records = data.get("date_records", [])
+                    if date_records:
+                        st.write(f"    各日期节点:")
+                        for dr in date_records:
+                            st.write(f"      · {dr['date']}: ${dr['steam_price']:.2f}, "
+                                     f"销量 {dr['steam_volume']} 件")
+                else:
+                    reason = _steam.get_last_steam_error(item_id=item.item_id)
+                    if data and not data.get("steam_price_history"):
+                        reason = reason or "Steam API 返回无价格数据"
+                    else:
+                        reason = reason or "Steam数据获取失败"
+                    ctx = _steam.get_last_steam_error_context(item_id=item.item_id)
+                    _log_error(3, item.item_id, item.name, reason, context=ctx)
+                    st.write(f"    ❌ {item.name}: 获取失败 - {reason}")
+                    st.session_state.failed_step3_items.append({
+                        "item_id": item.item_id,
+                        "buff_item_name": item.name,
+                        "target_dates": [
+                            r.date - timedelta(days=7) for r in item.price_history
+                        ],
+                        "base_skin_name": base_name,
+                    })
+
+            if group_idx < group_count:
+                sleep_random(2.0, 4.0)
+
+    except Exception as e:
+        import traceback
+        _log_error(3, "", "全部", f"Step 3 执行异常（已保留部分数据）: {e}")
+        st.write(f"  ❌ **Step 3 执行中断**: {e}")
+        traceback.print_exc()
 
     st.session_state.steam_data = steam_data
     st.session_state.stage3_done = True
@@ -365,48 +404,54 @@ def _execute_step4(conversion_rate, run_id=None):
     stable = st.session_state.stable_items
     steam_data = st.session_state.steam_data
     arbitrage_results = {}
-    for item in stable:
-        data = steam_data.get(item.item_id)
-        if not data or not data.get("steam_price_history"):
-            _log_error(4, item.item_id, item.name, "无Steam价格历史，跳过套利对比")
-            continue
-        buff_history = sorted(item.price_history, key=lambda r: r.date)
-        steam_history = sorted(data["steam_price_history"], key=lambda r: r.date)
-        buff_by_date = {r.date: r.price for r in buff_history}
-        steam_by_buff_date = {}
-        for r in steam_history:
-            steam_by_buff_date[r.date + timedelta(days=7)] = r
-        date_pairs = []
-        for buff_date in sorted(buff_by_date.keys()):
-            sr = steam_by_buff_date.get(buff_date)
-            if sr:
-                steam_price_cny = sr.price * conversion_rate
-                diff = buff_by_date[buff_date] - steam_price_cny
-                date_pairs.append({
-                    "buff_date": buff_date,
-                    "buff_price": buff_by_date[buff_date],
-                    "steam_date": sr.date,
-                    "steam_price_usd": sr.price,
-                    "steam_price_cny": steam_price_cny,
-                    "steam_volume": sr.volume,
-                    "diff": diff,
-                    "is_target": diff > 0,
-                })
-        if date_pairs:
-            avg_buff = sum(p["buff_price"] for p in date_pairs) / len(date_pairs)
-            avg_steam_usd = sum(p["steam_price_usd"] for p in date_pairs) / len(date_pairs)
-            avg_steam_cny = avg_steam_usd * conversion_rate
-            avg_diff = avg_buff - avg_steam_cny
-            is_target = avg_diff > 0
-            arbitrage_results[item.item_id] = {
-                "date_pairs": date_pairs,
-                "avg_buff_price": avg_buff,
-                "avg_steam_usd": avg_steam_usd,
-                "avg_steam_cny": avg_steam_cny,
-                "avg_diff": avg_diff,
-                "is_target": is_target,
-                "target_count": sum(1 for p in date_pairs if p["is_target"]),
-            }
+    try:
+        for item in stable:
+            data = steam_data.get(item.item_id)
+            if not data or not data.get("steam_price_history"):
+                _log_error(4, item.item_id, item.name, "无Steam价格历史，跳过套利对比")
+                continue
+            buff_history = sorted(item.price_history, key=lambda r: r.date)
+            steam_history = sorted(data["steam_price_history"], key=lambda r: r.date)
+            buff_by_date = {r.date: r.price for r in buff_history}
+            steam_by_buff_date = {}
+            for r in steam_history:
+                steam_by_buff_date[r.date + timedelta(days=7)] = r
+            date_pairs = []
+            for buff_date in sorted(buff_by_date.keys()):
+                sr = steam_by_buff_date.get(buff_date)
+                if sr:
+                    steam_price_cny = sr.price * conversion_rate
+                    diff = buff_by_date[buff_date] - steam_price_cny
+                    date_pairs.append({
+                        "buff_date": buff_date,
+                        "buff_price": buff_by_date[buff_date],
+                        "steam_date": sr.date,
+                        "steam_price_usd": sr.price,
+                        "steam_price_cny": steam_price_cny,
+                        "steam_volume": sr.volume,
+                        "diff": diff,
+                        "is_target": diff > 0,
+                    })
+            if date_pairs:
+                avg_buff = sum(p["buff_price"] for p in date_pairs) / len(date_pairs)
+                avg_steam_usd = sum(p["steam_price_usd"] for p in date_pairs) / len(date_pairs)
+                avg_steam_cny = avg_steam_usd * conversion_rate
+                avg_diff = avg_buff - avg_steam_cny
+                is_target = avg_diff > 0
+                arbitrage_results[item.item_id] = {
+                    "date_pairs": date_pairs,
+                    "avg_buff_price": avg_buff,
+                    "avg_steam_usd": avg_steam_usd,
+                    "avg_steam_cny": avg_steam_cny,
+                    "avg_diff": avg_diff,
+                    "is_target": is_target,
+                    "target_count": sum(1 for p in date_pairs if p["is_target"]),
+                }
+    except Exception as e:
+        import traceback
+        _log_error(4, "", "全部", f"Step 4 执行异常: {e}")
+        st.write(f"  ❌ **Step 4 执行中断**: {e}")
+        traceback.print_exc()
     st.session_state.arbitrage_results = arbitrage_results
     st.session_state.stage4_done = True
     st.session_state._run_conversion_rate = conversion_rate
@@ -451,6 +496,122 @@ with tabs[0]:
         st.success(f"一键获取完成！BUFF 原始 {len(raw)} 条 → 初步过滤 {len(filtered)} 条 "
                    f"→ 价格稳定 {len(stable)} 条 → Steam 数据 {len(steam_data)} 条")
 
+        # ── 分步状态 & 重新执行按钮 ──
+        st.divider()
+        _run_id_redo = st.session_state.current_run_id
+        s1_raw = len(raw)
+        s1_ok = len(filtered)
+        s2_ok = len(stable)
+        s3_ok = len(steam_data)
+        s3_total = len(stable)
+        s4_ok = sum(1 for v in arbitrage_results.values() if v.get("is_target")) if arbitrage_results else 0
+        s4_total = len(arbitrage_results)
+
+        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+
+        with col_r1:
+            st.metric("Step 1 BUFF筛选", f"{s1_ok} 条", delta=f"原始{s1_raw}条")
+            if st.button("🔄 重新执行 Step 1→4", key="redo_s1", use_container_width=True):
+                _cat_vals = [config.CATEGORY_OPTIONS[n] for n in category_names if n != "全部/不限"]
+                _clear_downstream_steps(1)
+                _execute_step1(target_date, target_count, _cat_vals, min_price, min_volume, _run_id_redo)
+                if st.session_state.filtered_items:
+                    _execute_step2(target_date, stable_days, volatility_threshold, _run_id_redo)
+                if st.session_state.stable_items:
+                    _execute_step3(_run_id_redo)
+                if st.session_state.steam_data:
+                    _execute_step4(conversion_rate, _run_id_redo)
+                st.rerun()
+
+        with col_r2:
+            _pass_rate = f"{s2_ok}/{len(filtered)}" if filtered else "N/A"
+            st.metric("Step 2 稳定性", f"{s2_ok} 条", delta=_pass_rate)
+            if st.button("🔄 重新执行 Step 2→4", key="redo_s2", use_container_width=True):
+                _clear_downstream_steps(2)
+                _execute_step2(target_date, stable_days, volatility_threshold, _run_id_redo)
+                if st.session_state.stable_items:
+                    _execute_step3(_run_id_redo)
+                if st.session_state.steam_data:
+                    _execute_step4(conversion_rate, _run_id_redo)
+                st.rerun()
+
+        with col_r3:
+            _s3_rate = f"{s3_ok}/{s3_total}" if s3_total else "N/A"
+            _s3_delta = "全部成功 ✅" if s3_ok >= s3_total else f"{s3_total-s3_ok}条失败 ⚠️" if s3_total else "N/A"
+            st.metric("Step 3 Steam数据", _s3_rate, delta=_s3_delta)
+            if st.button("🔄 重新执行 Step 3→4", key="redo_s3", use_container_width=True):
+                _clear_downstream_steps(3)
+                _execute_step3(_run_id_redo)
+                if st.session_state.steam_data:
+                    _execute_step4(conversion_rate, _run_id_redo)
+                st.rerun()
+
+        with col_r4:
+            _s4_delta = f"共{s4_total}个对比" if s4_total else "无数据 ❌"
+            st.metric("Step 4 套利结果", f"{s4_ok} 个目标", delta=_s4_delta)
+            if st.button("🔄 重新执行 Step 4", key="redo_s4", use_container_width=True):
+                _clear_downstream_steps(4)
+                _execute_step4(conversion_rate, _run_id_redo)
+                st.rerun()
+
+        # ── 失败饰品重试 ──
+        _failed_step3 = st.session_state.get("failed_step3_items", [])
+        if _failed_step3:
+            st.divider()
+            with st.expander(f"🔄 重试失败饰品（{len(_failed_step3)} 条）", expanded=False):
+                st.markdown("以下饰品 Step 3 获取失败，可单独或批量重试：")
+                for fi in _failed_step3:
+                    name = fi["buff_item_name"]
+                    col_a, col_b = st.columns([4, 1])
+                    with col_a:
+                        st.caption(f"{name}  (ID: {fi['item_id']})")
+                    with col_b:
+                        retry_key = f"redo_retry_{fi['item_id']}"
+                        if st.button("重试", key=retry_key, use_container_width=True):
+                            with st.spinner(f"正在重试 {name}..."):
+                                result = _steam.get_steam_market_data(
+                                    fi["item_id"], fi["target_dates"], fi["buff_item_name"],
+                                )
+                            if result:
+                                st.session_state.steam_data[fi["item_id"]] = result
+                                st.session_state.failed_step3_items = [
+                                    f for f in st.session_state.failed_step3_items
+                                    if f["item_id"] != fi["item_id"]
+                                ]
+                                st.success(f"✅ {name} 重试成功，正在重新计算套利对比...")
+                                _execute_step4(conversion_rate, _run_id_redo)
+                                st.rerun()
+                            else:
+                                err = _steam.get_last_steam_error(item_id=fi["item_id"]) or "未知错误"
+                                _log_error(3, fi["item_id"], name, err)
+                                st.error(f"❌ {name} 重试失败: {err}")
+
+                st.divider()
+                if st.button("🔄 重试全部失败饰品", type="primary",
+                              use_container_width=True, key="redo_retry_all"):
+                    with st.status("正在批量重试所有失败饰品...", expanded=True) as retry_status:
+                        batch_result = _steam.retry_steam_failed_items(_failed_step3)
+                        ok = 0
+                        for fi in _failed_step3:
+                            data = batch_result.get(fi["item_id"])
+                            if data:
+                                st.session_state.steam_data[fi["item_id"]] = data
+                                ok += 1
+                                retry_status.write(f"✅ {fi['buff_item_name']} 成功")
+                            else:
+                                err = _steam.get_last_steam_error(item_id=fi["item_id"]) or "失败"
+                                _log_error(3, fi["item_id"], fi["buff_item_name"], err)
+                                retry_status.write(f"❌ {fi['buff_item_name']} 失败")
+                        st.session_state.failed_step3_items = [
+                            f for f in _failed_step3
+                            if f["item_id"] not in batch_result
+                        ]
+                        st.success(f"重试完成: {ok}/{len(_failed_step3)} 成功，正在重新计算套利对比...")
+                        _execute_step4(conversion_rate, _run_id_redo)
+                        st.rerun()
+
+        st.divider()
+
         if arbitrage_results:
             target_items = [it for it in stable if arbitrage_results.get(it.item_id, {}).get("is_target")]
             st.header(f"🎯 发现 {len(target_items)} 个目标饰品")
@@ -461,6 +622,7 @@ with tabs[0]:
                 export_rows = []
                 for item in target_items:
                     ar = arbitrage_results.get(item.item_id, {})
+                    _steam_url = steam_data.get(item.item_id, {}).get("steam_url", "")
                     for p in ar.get("date_pairs", []):
                         if p["is_target"]:
                             export_rows.append({
@@ -470,14 +632,58 @@ with tabs[0]:
                                 "Steam日期": str(p["steam_date"]),
                                 "Steam价格($)": round(p["steam_price_usd"], 2),
                             })
+                # 目标饰品列表（含 Steam 链接）
+                target_rows = []
+                for item in target_items:
+                    ar = arbitrage_results.get(item.item_id, {})
+                    _steam_url = steam_data.get(item.item_id, {}).get("steam_url", "")
+                    target_rows.append({
+                        "饰品名称": item.name,
+                        "BUFF均价(¥)": f"¥{ar['avg_buff_price']:.2f}",
+                        "Steam均价(¥)": f"¥{ar['avg_steam_cny']:.2f}",
+                        "均价差(¥)": f"¥{ar['avg_diff']:+.2f}",
+                        "Steam链接": _steam_url if _steam_url else "无",
+                    })
+                st.dataframe(
+                    pd.DataFrame(target_rows),
+                    column_config={
+                        "Steam链接": st.column_config.LinkColumn("Steam链接", display_text="打开"),
+                    },
+                    use_container_width=True,
+                )
                 if export_rows:
                     df_export = pd.DataFrame(export_rows)
+                    from openpyxl.styles import Font, PatternFill, Alignment
+                    from openpyxl.utils import get_column_letter
                     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                         df_export.to_excel(writer, index=False, sheet_name="目标饰品")
+                        ws = writer.sheets["目标饰品"]
+                        # 表头加粗 + 浅灰底
+                        header_font = Font(bold=True)
+                        header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+                        for cell in ws[1]:
+                            cell.font = header_font
+                            cell.fill = header_fill
+                            cell.alignment = Alignment(horizontal="center")
+                        # 列宽自适应
+                        for col_idx, col in enumerate(df_export.columns, 1):
+                            max_len = max(
+                                df_export[col].astype(str).map(len).max(),
+                                len(str(col)),
+                            )
+                            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 30)
+                        # 冻结首行
+                        ws.freeze_panes = "A2"
+                        # 价格列数字格式
+                        for col_idx, col in enumerate(df_export.columns, 1):
+                            if "价格" in col:
+                                for row in range(2, ws.max_row + 1):
+                                    ws.cell(row=row, column=col_idx).number_format = '#,##0.00'
+                    _target_date_str = str(target_date)
                     st.download_button(
                         label="📥 导出Excel",
                         data=buf.getvalue(),
-                        file_name=f"arbitrage_targets_{date.today().isoformat()}.xlsx",
+                        file_name=f"套利结果_{_target_date_str}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
 
@@ -492,6 +698,7 @@ with tabs[0]:
                         f"→ {'✅' if p['is_target'] else '❌'}差¥{p['diff']:+.2f}"
                         for p in ar["date_pairs"]
                     )
+                    _steam_url = steam_data.get(item.item_id, {}).get("steam_url", "")
                     rows.append({
                         "饰品ID": item.item_id,
                         "名称": item.name,
@@ -502,8 +709,10 @@ with tabs[0]:
                         "命中节点": f"{ar['target_count']}/{len(ar['date_pairs'])}",
                         "判定": "🎯 目标" if ar["is_target"] else "未达标",
                         "各节点明细": date_details,
+                        "Steam链接": _steam_url if _steam_url else "无",
                     })
                 else:
+                    _steam_url = steam_data.get(item.item_id, {}).get("steam_url", "")
                     rows.append({
                         "饰品ID": item.item_id,
                         "名称": item.name,
@@ -514,8 +723,15 @@ with tabs[0]:
                         "命中节点": "N/A",
                         "判定": "无Steam数据",
                         "各节点明细": "无",
+                        "Steam链接": _steam_url if _steam_url else "无",
                     })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.dataframe(
+                pd.DataFrame(rows),
+                column_config={
+                    "Steam链接": st.column_config.LinkColumn("Steam链接", display_text="打开"),
+                },
+                use_container_width=True,
+            )
 
         # ---- 查看执行细则 ----
         with st.expander("📋 查看执行细则", expanded=False):
@@ -751,7 +967,7 @@ with tabs[0]:
                     st.write(f"**说明:** 每个饰品会打开 Steam 市场页面，匹配对应磨损/StatTrak 变体，")
                     st.write(f"获取历史售价及已售数量")
                     st.write(f"---")
-                    _execute_step3(run_id)
+                    _execute_step3(run_id, status=status)
                 steam_data = st.session_state.steam_data
                 fail_count = len(stable) - len(steam_data)
                 st.write(f"---")
@@ -810,7 +1026,7 @@ with tabs[0]:
         st.divider()
 
         # ---- 分步执行 ----
-        with st.expander("⚙️ 分步执行（含重新执行按钮）", expanded=not st.session_state.stage1_done):
+        with st.expander("⚙️ 分步执行（含重新执行按钮）", expanded=False):
             stage_names = ["BUFF初步筛选", "价格稳定性筛选", "Steam市场数据获取", "套利对比"]
             done_count = sum([
                 st.session_state.stage1_done,
@@ -1074,7 +1290,7 @@ with tabs[0]:
 
                 # ── 重试失败饰品 ──
                 if failed_items:
-                    with st.expander(f"🔄 重试失败饰品（{len(failed_items)} 条）", expanded=True):
+                    with st.expander(f"🔄 重试失败饰品（{len(failed_items)} 条）", expanded=False):
                         st.markdown("以下饰品 Step 3 获取失败，可单独或批量重试：")
                         for fi in failed_items:
                             name = fi["buff_item_name"]
@@ -1318,7 +1534,7 @@ with tabs[0]:
                             })
                     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-                    with st.expander("📋 查看每条处理明细", expanded=True):
+                    with st.expander("📋 查看每条处理明细", expanded=False):
                         detail_rows = []
                         for item in stable:
                             ar = arbitrage_results.get(item.item_id)
